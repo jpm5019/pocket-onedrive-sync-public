@@ -1,2 +1,2 @@
 # pocket-onedrive-sync-public
-Nightly sync of pocket AI personal assistant files to OneDrive folder for permanent storage.
+Nightly sync of pocket AI personal assistant files to OneDrive folder for permanent storage. Updated by Joe Moran on 06/18/2026.
