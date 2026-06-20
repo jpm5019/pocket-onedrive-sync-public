@@ -1,3 +1,6 @@
 requests
 azure-functions
 msal
+requests
+azure-identity
+azure-keyvault-secrets
