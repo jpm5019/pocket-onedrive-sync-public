@@ -1,183 +1,25 @@
-# =============================================================================
-# HeyPocket -> OneDrive  webhook additions
-# -----------------------------------------------------------------------------
-# WHERE THIS GOES:
-#   Paste these functions into your EXISTING function_app.py (repo root).
-#   KEEP your existing `pocket_sync` timer function — leave it in place as the
-#   low-frequency reconciliation safety net (drop it to once/day).
-#   Then commit + push to main; your working pipeline auto-deploys it.
-#
-# Design: webhook acks fast (<30s, Flex can cold-start) -> drops the recording
-# id on a Storage Queue -> a queue-triggered worker does the slow Graph upload.
-# =============================================================================
+name: Deploy Azure Function
 
-import os
-import time
-import json
-import hmac
-import hashlib
-import logging
+on:
+  push:
+    branches:
+      - main
 
-import requests
-import azure.functions as func
-from azure.identity import DefaultAzureCredential
-from azure.keyvault.secrets import SecretClient
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-# `app` is your existing func.FunctionApp() instance from the top of the file.
-# Do NOT create a second one — reuse the one your pocket_sync timer already uses.
+      - name: Package source
+        run: zip -r release.zip . -x "*.git*" ".github/*"
 
-# ----- config (set these as App Settings in the portal; see tomorrow's list) --
-KEY_VAULT_URI       = os.environ["KEY_VAULT_URI"]                 # https://<vault>.vault.azure.net/
-WEBHOOK_SECRET_NAME = os.environ.get("HEYPOCKET_SECRET_NAME", "heypocket-webhook-secret")
-GRAPH_REFRESH_NAME  = os.environ.get("GRAPH_REFRESH_SECRET_NAME", "graph-refresh-token")
-HEYPOCKET_KEY_NAME  = os.environ.get("HEYPOCKET_API_KEY_NAME", "heypocket-api-key")
-GRAPH_CLIENT_ID     = os.environ["GRAPH_CLIENT_ID"]
-GRAPH_TENANT        = os.environ.get("GRAPH_TENANT", "common")    # personal MSA -> "common"
-ONEDRIVE_FOLDER     = os.environ.get("ONEDRIVE_FOLDER", "PocketRecordings")
-QUEUE_NAME          = "pocket-sync-queue"
-REPLAY_WINDOW_MS    = 5 * 60 * 1000                              # 5 minutes
-
-_kv = SecretClient(vault_url=KEY_VAULT_URI, credential=DefaultAzureCredential())
-
-
-def _secret(name: str) -> str:
-    return _kv.get_secret(name).value
-
-
-# -----------------------------------------------------------------------------
-# 1) WEBHOOK ENTRY POINT  ->  verify, filter, enqueue, ack fast
-# -----------------------------------------------------------------------------
-@app.route(route="pocket-webhook", auth_level=func.AuthLevel.FUNCTION, methods=["POST"])
-@app.queue_output(arg_name="outq", queue_name=QUEUE_NAME, connection="AzureWebJobsStorage")
-def pocket_webhook(req: func.HttpRequest, outq: func.Out[str]) -> func.HttpResponse:
-    raw = req.get_body()  # EXACT bytes — never req.get_json() before verifying
-    ts  = req.headers.get("X-HeyPocket-Timestamp")
-    sig = req.headers.get("X-HeyPocket-Signature")
-
-    if not _verify(_secret(WEBHOOK_SECRET_NAME), ts, raw, sig):
-        logging.warning("HeyPocket webhook: signature verification failed")
-        return func.HttpResponse(status_code=401)
-
-    event = json.loads(raw)
-    etype = event.get("event")
-
-    # Sync the audio when a recording first exists. Add more events if you want
-    # to also react to summary.completed, transcription.completed, etc.
-    if etype != "recording.created":
-        return func.HttpResponse(status_code=200)  # ack but skip
-
-    rec_id = (event.get("recording") or {}).get("id")
-    if not rec_id:
-        return func.HttpResponse(status_code=200)
-
-    # Hand off to the worker and return immediately.
-    outq.set(json.dumps({"recording_id": rec_id}))
-    return func.HttpResponse(status_code=202)
-
-
-def _verify(secret: str, timestamp: str, raw_body: bytes, signature: str) -> bool:
-    if not (secret and timestamp and signature):
-        return False
-    # Reject stale deliveries (timestamp is in MILLISECONDS).
-    try:
-        if abs(time.time() * 1000 - int(timestamp)) > REPLAY_WINDOW_MS:
-            return False
-    except (ValueError, TypeError):
-        return False
-    signed = f"{timestamp}.".encode("utf-8") + raw_body
-    expected = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-
-# -----------------------------------------------------------------------------
-# 2) QUEUE WORKER  ->  fetch audio URL, download, resumable-upload to OneDrive
-# -----------------------------------------------------------------------------
-@app.queue_trigger(arg_name="msg", queue_name=QUEUE_NAME, connection="AzureWebJobsStorage")
-def pocket_upload_worker(msg: func.QueueMessage) -> None:
-    rec_id = json.loads(msg.get_body().decode("utf-8"))["recording_id"]
-    logging.info("Worker handling recording %s", rec_id)
-
-    # --- idempotency: at-least-once delivery means duplicates are expected. ---
-    # Simplest guard: name the OneDrive file by rec_id and use conflictBehavior
-    # 'fail' so a re-delivery no-ops. (Below uses 'replace' for simplicity —
-    # switch to 'fail' + catch 409 if you want strict once-only.)
-
-    audio_url, filename = _get_heypocket_audio_url(rec_id)
-    if not audio_url:
-        logging.error("No audio URL for %s; giving up this attempt", rec_id)
-        return  # raising would retry; returning drops it. Choose per your needs.
-
-    token = _graph_access_token()
-    with requests.get(audio_url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("Content-Length", 0))
-        _upload_resumable(token, f"{ONEDRIVE_FOLDER}/{filename}", r, total)
-    logging.info("Uploaded %s to OneDrive", filename)
-
-
-def _get_heypocket_audio_url(rec_id: str):
-    """Call HeyPocket 'Get audio download URL'. CONFIRM the exact request shape at
-    https://docs.heypocketai.com/docs/api/recordings/get-audio-download-url —
-    the path/param and response field below are the likely shape, verify them."""
-    api_key = _secret(HEYPOCKET_KEY_NAME)
-    resp = requests.get(
-        f"https://api.heypocketai.com/api/v1/recordings/{rec_id}/audio-download-url",
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("url"), f"{rec_id}.m4a"  # confirm field name + audio extension
-
-
-def _graph_access_token() -> str:
-    """Exchange the stored refresh token for an access token (personal MSA)."""
-    refresh = _secret(GRAPH_REFRESH_NAME)
-    resp = requests.post(
-        f"https://login.microsoftonline.com/{GRAPH_TENANT}/oauth2/v2.0/token",
-        data={
-            "client_id": GRAPH_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh,
-            "scope": "Files.ReadWrite offline_access",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    tok = resp.json()
-    # NOTE: MSA refresh tokens rotate. If a new refresh_token comes back, write it
-    # back to Key Vault so you don't go stale. Your existing pocket_sync code may
-    # already handle this — reuse that helper instead of duplicating it.
-    if tok.get("refresh_token"):
-        _kv.set_secret(GRAPH_REFRESH_NAME, tok["refresh_token"])
-    return tok["access_token"]
-
-
-def _upload_resumable(access_token: str, dest_path: str, stream, total: int) -> None:
-    """Graph resumable upload. Chunk size MUST be a multiple of 320 KiB."""
-    create = requests.post(
-        f"https://graph.microsoft.com/v1.0/me/drive/root:/{dest_path}:/createUploadSession",
-        headers={"Authorization": f"Bearer {access_token}"},
-        json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
-        timeout=30,
-    )
-    create.raise_for_status()
-    upload_url = create.json()["uploadUrl"]
-
-    chunk_size = 5 * 327680  # ~1.6 MB, multiple of 320 KiB
-    start = 0
-    for chunk in stream.iter_content(chunk_size=chunk_size):
-        if not chunk:
-            continue
-        end = start + len(chunk) - 1
-        crange = f"bytes {start}-{end}/{total}" if total else f"bytes {start}-{end}/*"
-        put = requests.put(
-            upload_url,
-            headers={"Content-Length": str(len(chunk)), "Content-Range": crange},
-            data=chunk,
-            timeout=120,
-        )
-        # 202 = more chunks expected; 200/201 = finished
-        if put.status_code not in (200, 201, 202):
-            put.raise_for_status()
-        start = end + 1
+      - name: Deploy to Azure Functions
+        uses: Azure/functions-action@v1
+        with:
+          app-name: pocket-sync-joemoran
+          package: release.zip
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
+          sku: flexconsumption
+          remote-build: true
